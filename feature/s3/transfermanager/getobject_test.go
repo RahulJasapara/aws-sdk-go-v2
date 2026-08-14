@@ -198,10 +198,11 @@ func TestGetObject(t *testing.T) {
 			data:        []byte("ab"),
 			getObjectFn: s3testing.ErrReaderFn,
 			errReaders: []s3testing.TestErrReader{
-				{Buf: []byte("ab"), Len: 2, Err: io.ErrUnexpectedEOF},
+				{Buf: []byte("ab"), Len: 3, Err: io.ErrUnexpectedEOF},
 			},
 			optFn: func(o *Options) {
 				o.GetObjectType = types.GetObjectRanges
+				o.PartBodyMaxRetries = 1
 			},
 			expectInvocations: 1,
 			expectReadErr:     "unexpected EOF",
@@ -298,9 +299,11 @@ func TestGetObject(t *testing.T) {
 		"part download fail retry": {
 			data:        []byte("ab"),
 			getObjectFn: s3testing.ErrReaderFn,
-			optFn:       func(o *Options) {},
+			optFn: func(o *Options) {
+				o.PartBodyMaxRetries = 1
+			},
 			errReaders: []s3testing.TestErrReader{
-				{Buf: []byte("ab"), Len: 2, Err: io.ErrUnexpectedEOF},
+				{Buf: []byte("ab"), Len: 3, Err: io.ErrUnexpectedEOF},
 			},
 			expectInvocations: 1,
 			expectReadErr:     "unexpected EOF",
@@ -424,7 +427,11 @@ func TestGetAsyncWithFailure(t *testing.T) {
 			s3Client.PartsCount = 10
 			s3Client.Data = buf80MB
 			s3Client.GetObjectFn = func(c *s3testing.TransferManagerLoggingClient, params *s3.GetObjectInput) (out *s3.GetObjectOutput, err error) {
-				count := reqCount.Load()
+				// Assign each call a unique index atomically. The reader spawns
+				// its workers up front and issues part requests concurrently, so
+				// a non-atomic load-then-add would let two calls observe the same
+				// count and neither would take the failing branch.
+				count := reqCount.Add(1) - 1
 				switch count {
 				case 1:
 					// Give a chance for the multipart chunks to be queued up
@@ -451,7 +458,6 @@ func TestGetAsyncWithFailure(t *testing.T) {
 					}
 				}
 
-				reqCount.Add(1)
 				return out, err
 			}
 

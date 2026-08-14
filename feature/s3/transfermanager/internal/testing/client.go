@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -39,6 +40,12 @@ type TransferManagerLoggingClient struct {
 	PartsCount int32
 
 	GetObjectInvocations int
+
+	// InFlight tracks GetObject calls currently executing, and MaxInFlight the
+	// high-water mark. They let download tests assert the reader honors its
+	// sliding in-flight window (parallelism cap).
+	InFlight    atomic.Int32
+	MaxInFlight atomic.Int32
 
 	HeadObjectInputs []*s3.HeadObjectInput
 
@@ -223,8 +230,6 @@ func (c *TransferManagerLoggingClient) AbortMultipartUpload(ctx context.Context,
 // GetObject is the S3 GetObject API.
 func (c *TransferManagerLoggingClient) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	c.m.Lock()
-	defer c.m.Unlock()
-
 	c.traceOperation("GetObject", params)
 	c.GetObjectInvocations++
 
@@ -236,9 +241,22 @@ func (c *TransferManagerLoggingClient) GetObject(ctx context.Context, params *s3
 	}
 	c.Versions = append(c.Versions, aws.ToString(params.VersionId))
 	c.Etags = append(c.Etags, aws.ToString(params.IfMatch))
+	fn := c.GetObjectFn
+	c.m.Unlock()
 
-	if c.GetObjectFn != nil {
-		return c.GetObjectFn(c, params)
+	// Track concurrency outside the lock so a blocking GetObjectFn actually
+	// overlaps with others; the high-water mark reflects the reader's window.
+	cur := c.InFlight.Add(1)
+	defer c.InFlight.Add(-1)
+	for {
+		m := c.MaxInFlight.Load()
+		if cur <= m || c.MaxInFlight.CompareAndSwap(m, cur) {
+			break
+		}
+	}
+
+	if fn != nil {
+		return fn(c, params)
 	}
 
 	return &s3.GetObjectOutput{}, nil
