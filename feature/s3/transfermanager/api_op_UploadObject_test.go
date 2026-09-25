@@ -1414,6 +1414,93 @@ const completeUploadResp = `<CompleteMultipartUploadResponse>
 
 const abortUploadResp = `<AbortMultipartUploadResponse></AbortMultipartUploadResponse>`
 
+// TestUploadSectionContentSeekedBody verifies the section read path uploads
+// the correct bytes for every part when workers read the source concurrently,
+// honors a body seeked mid-source by uploading only the bytes after its
+// current position, and never moves the body's seek cursor.
+func TestUploadSectionContentSeekedBody(t *testing.T) {
+	const prefix = 512
+	payload := make([]byte, 20*1024*1024)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	body := bytes.NewReader(append(make([]byte, prefix), payload...))
+	if _, err := body.Seek(prefix, io.SeekStart); err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+
+	parts := map[int32][]byte{}
+	c, _, _ := s3testing.NewUploadLoggingClient(nil)
+	c.UploadPartFn = func(ctx context.Context, cl *s3testing.TransferManagerLoggingClient, params *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
+		b, err := io.ReadAll(params.Body)
+		if err != nil {
+			return nil, err
+		}
+		parts[aws.ToInt32(params.PartNumber)] = b
+		return &s3.UploadPartOutput{ETag: aws.String(fmt.Sprintf("ETAG%d", aws.ToInt32(params.PartNumber)))}, nil
+	}
+
+	mgr := New(c)
+	_, err := mgr.UploadObject(context.Background(), &UploadObjectInput{
+		Bucket: aws.String("Bucket"),
+		Key:    aws.String("Key"),
+		Body:   body,
+	})
+	if err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+
+	var got []byte
+	for i := int32(1); i <= int32(len(parts)); i++ {
+		p, ok := parts[i]
+		if !ok {
+			t.Fatalf("expect part %d to be uploaded, got parts %v", i, len(parts))
+		}
+		got = append(got, p...)
+	}
+	if !bytes.Equal(payload, got) {
+		t.Errorf("expect reassembled parts to match the seeked payload, lengths %d != %d", len(payload), len(got))
+	}
+
+	if pos, _ := body.Seek(0, io.SeekCurrent); pos != prefix {
+		t.Errorf("expect body seek position to be untouched at %d, got %d", prefix, pos)
+	}
+}
+
+// TestUploadSectionSingleSeekedBody verifies a seeked body under the multipart
+// threshold uploads the bytes after its current position via a single PutObject.
+func TestUploadSectionSingleSeekedBody(t *testing.T) {
+	const prefix = "unwanted-prefix"
+	const payload = "expected-payload"
+	body := strings.NewReader(prefix + payload)
+	if _, err := body.Seek(int64(len(prefix)), io.SeekStart); err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+
+	c, invocations, params := s3testing.NewUploadLoggingClient(nil)
+	mgr := New(c)
+	_, err := mgr.UploadObject(context.Background(), &UploadObjectInput{
+		Bucket: aws.String("Bucket"),
+		Key:    aws.String("Key"),
+		Body:   body,
+	})
+	if err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+
+	if diff := cmpDiff([]string{"PutObject"}, *invocations); len(diff) > 0 {
+		t.Error(diff)
+	}
+
+	b, err := io.ReadAll((*params)[0].(*s3.PutObjectInput).Body)
+	if err != nil {
+		t.Fatalf("expect no error, got %v", err)
+	}
+	if e, a := payload, string(b); e != a {
+		t.Errorf("expect %q body, got %q", e, a)
+	}
+}
+
 func cmpDiff(e, a any) string {
 	if !reflect.DeepEqual(e, a) {
 		return fmt.Sprintf("%v != %v", e, a)

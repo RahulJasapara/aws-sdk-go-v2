@@ -831,7 +831,19 @@ type uploader struct {
 	objectSize   int64
 	multipleRead bool
 
+	// readerAt is set when the input Body supports concurrent positioned reads,
+	// letting part workers read their own section of the source directly instead
+	// of funneling every byte through a single buffered reader
+	readerAt   io.ReaderAt
+	readerBase int64
+	readerPos  int64
+
 	progressEmitter *singleObjectProgressEmitter
+}
+
+type readerAtSeeker interface {
+	io.ReaderAt
+	io.ReadSeeker
 }
 
 func (u *uploader) upload(ctx context.Context) (*UploadObjectOutput, error) {
@@ -860,8 +872,12 @@ func (u *uploader) upload(ctx context.Context) (*UploadObjectOutput, error) {
 		return nil, err
 	}
 
-	u.partPool = newDefaultSlicePool(u.options.PartSizeBytes, u.options.Concurrency+1) // only create the caching pool for multipart upload
-	defer u.partPool.Close()
+	if u.readerAt == nil {
+		// only create the caching pool for multipart upload; the section read
+		// path streams parts from the source and allocates no part buffers
+		u.partPool = newDefaultSlicePool(u.options.PartSizeBytes, u.options.Concurrency+1)
+		defer u.partPool.Close()
+	}
 	mu := multiUploader{
 		uploader: u,
 	}
@@ -873,6 +889,9 @@ func (u *uploader) init() error {
 		Listeners: u.options.ObjectProgressListeners,
 	}
 	if err := u.initSize(); err != nil {
+		return err
+	}
+	if err := u.initReaderAt(); err != nil {
 		return err
 	}
 
@@ -908,6 +927,26 @@ func (u *uploader) initSize() error {
 	return nil
 }
 
+// initReaderAt enables the section read path when the input Body supports it.
+// io.ReaderAt guarantees parallel ReadAt calls on the same source are safe, so
+// each part worker can read its own range concurrently with no shared cursor.
+// The current seek position is recorded so a body seeked mid-source uploads the
+// same bytes the sequential path would, and is never moved afterwards.
+func (u *uploader) initReaderAt() error {
+	r, ok := u.in.Body.(readerAtSeeker)
+	if !ok {
+		return nil
+	}
+
+	base, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	u.readerAt = r
+	u.readerBase = base
+	return nil
+}
+
 func (u *uploader) singleUpload(ctx context.Context, r io.Reader, sz int, cleanUp func(), clientOptions ...func(*s3.Options)) (*UploadObjectOutput, error) {
 	defer cleanUp()
 
@@ -937,6 +976,9 @@ func (u *uploader) singleUpload(ctx context.Context, r io.Reader, sz int, cleanU
 
 // nextReader reads the next chunk of data from input Body
 func (u *uploader) nextReader(ctx context.Context) (io.Reader, int, func(), error) {
+	if u.readerAt != nil {
+		return u.nextSectionReader()
+	}
 	if !u.multipleRead {
 		u.multipleRead = true
 		// read first part up to a maximum of PartSize to avoid allocating 8MB buffer out of the gate
@@ -973,6 +1015,35 @@ func (u *uploader) nextReader(ctx context.Context) (io.Reader, int, func(), erro
 		u.partPool.Put(part)
 	}
 	return bytes.NewReader(part[0:n]), n, cleanup, err
+}
+
+// nextSectionReader hands out the next chunk as a section of the source read
+// at its own offset, so concurrent part workers pull their bytes directly from
+// the source with no intermediate part buffer. It follows nextReader's
+// contract: the first chunk decides single vs multipart upload against the
+// threshold, and the final chunk is returned together with io.EOF.
+func (u *uploader) nextSectionReader() (io.Reader, int, func(), error) {
+	remaining := u.objectSize - u.readerPos
+	first := !u.multipleRead
+	u.multipleRead = true
+
+	if first && remaining < u.options.MultipartUploadThreshold {
+		r := io.NewSectionReader(u.readerAt, u.readerBase, remaining)
+		u.readerPos += remaining
+		return r, int(remaining), func() {}, io.EOF
+	}
+
+	n := min(remaining, u.options.PartSizeBytes)
+	var err error
+	// the first chunk of a multipart upload must return a nil error even when
+	// it covers the whole source, so upload routes it to the multiUploader
+	if !first && u.readerPos+n >= u.objectSize {
+		err = io.EOF
+	}
+
+	r := io.NewSectionReader(u.readerAt, u.readerBase+u.readerPos, n)
+	u.readerPos += n
+	return r, int(n), func() {}, err
 }
 
 func (u *uploader) freshContext(ctx context.Context) (context.Context, context.CancelFunc) {
