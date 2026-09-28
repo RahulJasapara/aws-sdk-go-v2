@@ -928,10 +928,11 @@ func (u *uploader) initSize() error {
 }
 
 // initReaderAt enables the section read path when the input Body supports it.
-// io.ReaderAt guarantees parallel ReadAt calls on the same source are safe, so
-// each part worker can read its own range concurrently with no shared cursor.
-// The current seek position is recorded so a body seeked mid-source uploads the
-// same bytes the sequential path would, and is never moved afterwards.
+// The io.ReaderAt contract requires implementations to support parallel ReadAt
+// calls on the same source, so each part worker can read its own range
+// concurrently with no shared cursor. The current seek position is recorded so
+// a body seeked mid-source uploads the same bytes the sequential path would,
+// and is never moved afterwards.
 func (u *uploader) initReaderAt() error {
 	r, ok := u.in.Body.(readerAtSeeker)
 	if !ok {
