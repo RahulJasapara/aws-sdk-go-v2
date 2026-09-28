@@ -4,6 +4,8 @@ package transfermanager
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -21,6 +23,9 @@ func TestInteg_PutObject(t *testing.T) {
 			ChecksumAlgorithm: types.ChecksumAlgorithmCrc32c,
 			ChecksumType:      types.ChecksumTypeFullObject,
 		},
+		// an *os.File body has its parts read concurrently at their own offsets
+		// straight off the file descriptor, so verify the reassembled object
+		"multipart upload file body": {Body: largeObjectFile(t), ExpectBody: largeObjectBuf},
 	}
 
 	for name, c := range cases {
@@ -28,4 +33,21 @@ func TestInteg_PutObject(t *testing.T) {
 			testPutObject(t, setupMetadata.Buckets.Source.Name, c)
 		})
 	}
+}
+
+// largeObjectFile writes largeObjectBuf to a temp file and returns it opened
+// for reading, closed and removed when the test finishes
+func largeObjectFile(t *testing.T) *os.File {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "large-object")
+	if err := os.WriteFile(path, largeObjectBuf, 0o600); err != nil {
+		t.Fatalf("failed to write large object file, %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("failed to open large object file, %v", err)
+	}
+	t.Cleanup(func() { f.Close() })
+	return f
 }
